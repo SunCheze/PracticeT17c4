@@ -27,8 +27,8 @@ graph TD
     end
 
     %% Стилизация
-    classDef spark fill:#f9f,stroke:#333,stroke-width:2px;
-    classDef storage fill:#ff9,stroke:#333,stroke-width:2px;
+    classDef spark fill:#123195,stroke:#ffffff,stroke-width:2px,color:#ffffff;
+    classDef storage fill:#123195,stroke:#ffffff,stroke-width:2px,color:#ffffff;
     class D,E,F,G,I,J spark;
     class B,H,K storage;
 
