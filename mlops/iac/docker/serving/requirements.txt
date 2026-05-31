@@ -1,0 +1,9 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+catboost==1.2.10
+numpy==2.4.4
+pandas==3.0.2
+mlflow==2.19.0
+boto3==1.35.93
+prometheus-client==0.21.1
