@@ -1,0 +1,210 @@
+# =============================================================================
+# Entity Resolution — ML-стек уровня MLOps 2
+# =============================================================================
+# Декларативное описание всей инфраструктуры. Запуск: `docker compose up -d`.
+#
+# Архитектура:
+#   - postgres        — backend для MLflow + Airflow + feature store
+#   - minio           — S3-совместимое хранилище для артефактов модели и DVC
+#   - mlflow          — tracking server + Model Registry
+#   - airflow         — оркестратор retraining-DAG'ов
+#   - model-serving   — FastAPI с CatBoost ONNX (две реплики для blue/green)
+#   - traffic-router  — Nginx, переключает трафик между production и canary
+#   - prometheus      — сбор метрик
+#   - grafana         — дашборды качества модели и инфраструктуры
+# =============================================================================
+
+services:
+
+  # --------------------------------------------------------------------------- 
+  # Storage: PostgreSQL + MinIO
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${PG_USER:-mlops}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-mlops}
+      POSTGRES_MULTIPLE_DATABASES: mlflow,airflow,features
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init/postgres-init-multiple-dbs.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-mlops}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # консоль
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 5s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------- 
+  # MLflow — tracking + Model Registry
+  # ---------------------------------------------------------------------------
+  mlflow:
+    build: ./mlflow
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://${PG_USER:-mlops}:${PG_PASSWORD:-mlops}@postgres/mlflow
+      MLFLOW_ARTIFACT_ROOT: s3://mlflow-artifacts/
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-minioadmin}
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      minio:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------- 
+  # Airflow — оркестратор retraining-DAG'ов
+  # ---------------------------------------------------------------------------
+  airflow-webserver:
+    image: apache/airflow:2.10.4-python3.11
+    command: webserver
+    environment: &airflow-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${PG_USER:-mlops}:${PG_PASSWORD:-mlops}@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-minioadmin}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/plugins:/opt/airflow/plugins:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  airflow-scheduler:
+    image: apache/airflow:2.10.4-python3.11
+    command: scheduler
+    environment: *airflow-env
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - ./airflow/plugins:/opt/airflow/plugins:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------- 
+  # Model serving — blue/green-схема для безопасного промоушена
+  # ---------------------------------------------------------------------------
+  # production-реплика: текущая модель в эксплуатации.
+  serving-production:
+    build: ./serving
+    environment:
+      MODEL_STAGE: production
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-minioadmin}
+      THRESHOLDS_PATH: /app/models/thresholds.json
+    expose: ["8000"]   # доступен только через traffic-router
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      mlflow: { condition: service_healthy }
+    restart: unless-stopped
+
+  # canary-реплика: новая модель на shadow/canary-этапе.
+  # Поднимается тем же образом, но загружает stage=Staging из MLflow.
+  serving-canary:
+    build: ./serving
+    environment:
+      MODEL_STAGE: staging
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-minioadmin}
+    expose: ["8000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+    depends_on:
+      mlflow: { condition: service_healthy }
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------- 
+  # Traffic router — Nginx с weighted upstream
+  # ---------------------------------------------------------------------------
+  # Веса production/canary задаются в nginx.conf и переключаются через reload.
+  # 100/0 — нормальный режим
+  # 90/10 — canary
+  # 0/100 — после promote: canary стал production
+  # 100/0 (на бывшую canary) — после rollback
+  traffic-router:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./router/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - serving-production
+      - serving-canary
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 15s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------- 
+  # Monitoring — Prometheus + Grafana
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana-datasources.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
+      - ./monitoring/grafana-dashboards/:/var/lib/grafana/dashboards/:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+
+volumes:
+  postgres_data:
+  minio_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  default:
+    name: er-mlops

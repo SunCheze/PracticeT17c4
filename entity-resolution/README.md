@@ -214,9 +214,3 @@ python -m scripts.predict --input <ваш файл> --output-pairs /tmp/p.csv --
 - **Continuous learning** — метки из REVIEW-очереди в обучающую выборку.
 
 См. технический отчёт в /docs репозитория.
-
----
-
-## Лицензия
-
-Внутренний проект. Не распространяется.

@@ -1,0 +1,60 @@
+groups:
+  - name: er_serving_slo
+    interval: 30s
+    rules:
+
+      # ---------- SLI: latency ----------
+      # SLO: p95 latency ≤ 100 мс (за окно 5 минут)
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(0.95, sum by (le, stage) (
+            rate(er_latency_seconds_bucket{stage="production"}[5m])
+          )) > 0.1
+        for: 10m
+        labels: { severity: warning, component: serving }
+        annotations:
+          summary: "p95 latency > 100мс на production-сервинге"
+          description: "Текущий p95 = {{ $value }}с. SLO нарушен в окне 5 минут."
+
+      # ---------- SLI: availability ----------
+      # SLO: ≥ 99.9% успешных ответов /score
+      - alert: LowAvailability
+        expr: |
+          sum(rate(er_requests_total{status="ok"}[5m]))
+          / sum(rate(er_requests_total[5m])) < 0.999
+        for: 5m
+        labels: { severity: critical, component: serving }
+        annotations:
+          summary: "Availability < 99.9% (за 5 минут)"
+
+      # ---------- SLI: дрейф вероятностей ----------
+      # SLO: средний P(match) на скользящем окне 1 час не должен меняться > чем на 50%
+      - alert: ProbabilityDistributionDrift
+        expr: |
+          abs(avg_over_time(er_prob_match_mean[1h])
+              - avg_over_time(er_prob_match_mean[7d] offset 1h))
+          > 0.05
+        for: 30m
+        labels: { severity: warning, component: model }
+        annotations:
+          summary: "Дрейф распределения P(match) > 0.05 относительно baseline"
+
+      # ---------- SLI: модель загружена ----------
+      - alert: ModelNotLoaded
+        expr: up{job="serving-production"} == 0
+        for: 2m
+        labels: { severity: critical, component: serving }
+        annotations:
+          summary: "Production-сервинг недоступен"
+
+      # ---------- SLI: REVIEW-очередь не растёт бесконтрольно ----------
+      # SLO: доля REVIEW-действий не превышает 30% от всех решений
+      - alert: ReviewQueueOverflow
+        expr: |
+          rate(er_actions_total{action="REVIEW"}[10m])
+          / ignoring(action) group_left
+          sum(rate(er_actions_total[10m])) > 0.3
+        for: 30m
+        labels: { severity: warning, component: model }
+        annotations:
+          summary: "Слишком много пар идут в REVIEW (>30%) — модель потеряла уверенность"

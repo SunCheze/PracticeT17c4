@@ -16,13 +16,8 @@ import argparse
 import json
 from pathlib import Path
 
-import sys
-
-# Добавляем родительскую директорию в путь поиска
-sys.path.append(str(Path(__file__).parent.parent))
 
 import numpy as np
-import er
 import pandas as pd
 from sklearn.metrics import average_precision_score, classification_report
 

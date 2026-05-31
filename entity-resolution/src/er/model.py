@@ -60,11 +60,37 @@ def train_model(
     return model
 
 
+# def predict_proba(model: CatBoostClassifier, X: pd.DataFrame, cat_features: list[str] | None = None) -> np.ndarray:
+#     """Возвращает P(match) для каждой пары."""
+#     for col in cat_features:
+#         if col in X.columns:
+#             X[col] = X[col].fillna(-1).astype(str)
+#     if cat_features is None:
+#         cat_features = [c for c in X.columns if c.startswith("match_")]
+#     X = _prepare(X, cat_features)
+#     return model.predict_proba(X)[:, 1]
+
 def predict_proba(model: CatBoostClassifier, X: pd.DataFrame, cat_features: list[str] | None = None) -> np.ndarray:
     """Возвращает P(match) для каждой пары."""
+    
+    # 1. ЖЕСТКАЯ КОПИЯ. Защищает от молчаливого игнорирования изменений в срезах датафрейма
+    X = X.copy()
+    
+    # 2. Определяем категориальные фичи ДО того, как начнем с ними работать
     if cat_features is None:
         cat_features = [c for c in X.columns if c.startswith("match_")]
+        
+    # 3. Вызываем вашу внутреннюю подготовку данных
     X = _prepare(X, cat_features)
+    
+    # 4. ФИНАЛЬНАЯ ОЧИСТКА ТИПОВ прямо перед отправкой в CatBoost
+    # Это гарантированно перезапишет любые баги, которые могла создать функция _prepare
+    for col in cat_features:
+        if col in X.columns:
+            # Превращаем NaN в строку "-1", а остальные числа в "1", "0"
+            X.loc[:, col] = X[col].fillna(-1).astype(str)
+
+    # 5. Теперь CatBoost 100% получит строки и не упадет
     return model.predict_proba(X)[:, 1]
 
 
